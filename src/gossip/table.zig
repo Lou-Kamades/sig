@@ -14,26 +14,18 @@ const GossipVersionedData = sig.gossip.data.GossipVersionedData;
 const GossipKey = sig.gossip.data.GossipKey;
 const LegacyContactInfo = sig.gossip.data.LegacyContactInfo;
 const ContactInfo = sig.gossip.data.ContactInfo;
-const Vote = sig.gossip.data.Vote;
+const ThreadSafeContactInfo = sig.gossip.data.ThreadSafeContactInfo;
 const ThreadPool = sig.sync.ThreadPool;
 const Task = sig.sync.ThreadPool.Task;
 const Batch = sig.sync.ThreadPool.Batch;
 const Hash = sig.core.hash.Hash;
-const Transaction = sig.core.transaction.Transaction;
 const Pubkey = sig.core.Pubkey;
 const SocketAddr = sig.net.SocketAddr;
 
-const getWallclockMs = sig.gossip.data.getWallclockMs;
-
 const PACKET_DATA_SIZE = sig.net.packet.PACKET_DATA_SIZE;
 
-pub const UNIQUE_PUBKEY_CAPACITY: usize = 8192;
-pub const MAX_TABLE_SIZE: usize = 1_000_000; // TODO: better value for this
-
-pub const TableError = error{
-    OldValue,
-    DuplicateValue,
-};
+pub const UNIQUE_PUBKEY_CAPACITY: usize = 8_192;
+pub const MAX_TABLE_SIZE: usize = 100_000; // TODO: better value for this
 
 pub const HashAndTime = struct { hash: Hash, timestamp: u64 };
 
@@ -103,10 +95,16 @@ pub const GossipTable = struct {
     // head of the store
     cursor: usize = 0,
 
+    // NOTE: this allocator is used to free any memory allocated by the bincode library
     allocator: std.mem.Allocator,
     thread_pool: *ThreadPool,
 
     const Self = @This();
+
+    pub const InsertionError = error{
+        OldValue,
+        DuplicateValue,
+    };
 
     pub fn init(allocator: std.mem.Allocator, thread_pool: *ThreadPool) !Self {
         return Self{
@@ -150,12 +148,12 @@ pub const GossipTable = struct {
 
         var store_iter = self.store.iterator();
         while (store_iter.next()) |entry| {
-            bincode.free(self.allocator, entry.value_ptr.value.data);
+            entry.value_ptr.value.data.deinit(self.allocator);
         }
         self.store.deinit();
     }
 
-    pub fn insert(self: *Self, value: SignedGossipData, now: u64) !void {
+    pub fn insert(self: *Self, value: SignedGossipData, now: u64) !bool {
         if (self.store.count() >= MAX_TABLE_SIZE) {
             return error.GossipTableFull;
         }
@@ -217,6 +215,7 @@ pub const GossipTable = struct {
 
             self.cursor += 1;
 
+            return true;
             // should overwrite existing entry
         } else if (versioned_value.overwrites(result.value_ptr)) {
             const old_entry = result.value_ptr.*;
@@ -267,6 +266,7 @@ pub const GossipTable = struct {
             result.value_ptr.* = versioned_value;
 
             self.cursor += 1;
+            return true;
 
             // do nothing
         } else {
@@ -275,23 +275,24 @@ pub const GossipTable = struct {
             if (old_entry.value_hash.order(&versioned_value.value_hash) != .eq) {
                 // if hash isnt the same and override() is false then msg is old
                 try self.purged.insert(old_entry.value_hash, now);
-                return TableError.OldValue;
+                return InsertionError.OldValue;
             } else {
                 // hash is the same then its a duplicate
-                return TableError.DuplicateValue;
+                return InsertionError.DuplicateValue;
             }
+
+            return false;
         }
     }
 
     pub fn insertValues(
         self: *Self,
+        now: u64,
         values: []SignedGossipData,
         timeout: u64,
         comptime record_inserts: bool,
         comptime record_timeouts: bool,
     ) error{OutOfMemory}!InsertResults {
-        const now = getWallclockMs();
-
         // TODO: change to record duplicate and old values seperately + handle when
         // gossip table is full
         var failed_indexs = std.ArrayList(usize).init(self.allocator);
@@ -309,13 +310,11 @@ pub const GossipTable = struct {
                 continue;
             }
 
-            self.insert(value, now) catch {
-                try failed_indexs.append(index);
-                continue;
-            };
-
-            if (record_inserts) {
+            const was_inserted = self.insert(value, now) catch false;
+            if (was_inserted) {
                 try inserted_indexs.append(index);
+            } else {
+                try failed_indexs.append(index);
             }
         }
 
@@ -337,12 +336,11 @@ pub const GossipTable = struct {
     /// For simplicity and performance, only tracks failures without `inserted` and `timeouts`,
     pub fn insertValuesMinAllocs(
         self: *Self,
+        now: u64,
         values: []SignedGossipData,
         timeout: u64,
         failed_indexes: *std.ArrayList(usize),
     ) error{OutOfMemory}!void {
-        const now = getWallclockMs();
-
         failed_indexes.clearRetainingCapacity();
         try failed_indexes.ensureTotalCapacity(values.len);
 
@@ -354,10 +352,10 @@ pub const GossipTable = struct {
                 continue;
             }
 
-            self.insert(value, now) catch {
+            const did_insert = self.insert(value, now) catch false;
+            if (!did_insert) {
                 failed_indexes.appendAssumeCapacity(index);
-                continue;
-            };
+            }
         }
     }
 
@@ -398,22 +396,44 @@ pub const GossipTable = struct {
 
     /// Since a node may be represented with ContactInfo or LegacyContactInfo,
     /// this function checks for both, and efficiently returns the data as
-    /// ContactInfo, regardless of how it was received.
-    pub fn getContactInfo(self: *const Self, pubkey: Pubkey) ?ContactInfo {
+    /// ThreadSafeContactInfo, regardless of how it was received.
+    pub fn getThreadSafeContactInfo(self: *const Self, pubkey: Pubkey) ?ThreadSafeContactInfo {
         const label = GossipKey{ .ContactInfo = pubkey };
         if (self.store.get(label)) |v| {
-            return v.value.data.ContactInfo;
+            return ThreadSafeContactInfo.fromContactInfo(v.value.data.ContactInfo);
         } else {
-            return self.converted_contact_infos.get(pubkey);
+            return ThreadSafeContactInfo.fromContactInfo(self.converted_contact_infos.get(pubkey) orelse return null);
         }
     }
 
-    pub fn genericGetWithCursor(
+    /// Iterates over the values in the given hashmap and looks up the
+    /// corresponding values in the store. If the value is found, it is
+    /// copied into the buffer. The cursor is updated to the last index
+    /// that was copied.
+    ///
+    /// NOTE: if the allocator is null, the values are
+    /// not cloned and the buffer will contain references to the store.
+    /// In this case, its not safe to access these values across lock boundaries.
+    ///
+    /// Typical usage is to call this function with one of the tracked fields.
+    /// For example, using `GossipTable.contact_infos` or `GossipTable.votes` as
+    /// the `hashmap` field will return the corresponding ContactInfos or Votes from the store.
+    ///
+    /// eg,
+    /// genericGetWithCursor(
+    ///     allocator,
+    ///     self.votes,
+    ///     self.store,
+    ///     &buf,
+    ///     &caller_cursor,
+    /// );
+    fn genericGetEntriesWithCursor(
+        allocator: ?std.mem.Allocator,
         hashmap: anytype,
         store: AutoArrayHashMap(GossipKey, GossipVersionedData),
         buf: []GossipVersionedData,
         caller_cursor: *usize,
-    ) []GossipVersionedData {
+    ) error{OutOfMemory}![]GossipVersionedData {
         const cursor_indexs = hashmap.keys();
         const store_values = store.values();
 
@@ -425,7 +445,7 @@ pub const GossipTable = struct {
 
             const entry_index = hashmap.get(cursor_index).?;
             const entry = store_values[entry_index];
-            buf[index] = entry;
+            buf[index] = if (allocator == null) entry else try entry.clone(allocator.?);
             index += 1;
 
             if (index == buf.len) {
@@ -437,12 +457,14 @@ pub const GossipTable = struct {
         return buf[0..index];
     }
 
-    pub fn getEntriesWithCursor(
+    pub fn getClonedEntriesWithCursor(
         self: *const Self,
+        allocator: std.mem.Allocator,
         buf: []GossipVersionedData,
         caller_cursor: *usize,
-    ) []GossipVersionedData {
-        return genericGetWithCursor(
+    ) error{OutOfMemory}![]GossipVersionedData {
+        return genericGetEntriesWithCursor(
+            allocator,
             self.entries,
             self.store,
             buf,
@@ -450,43 +472,22 @@ pub const GossipTable = struct {
         );
     }
 
-    pub fn getVotesWithCursor(
-        self: *Self,
-        buf: []GossipVersionedData,
-        caller_cursor: *usize,
-    ) ![]GossipVersionedData {
-        return genericGetWithCursor(
-            self.votes,
-            self.store,
-            buf,
-            caller_cursor,
-        );
-    }
-
-    pub fn getEpochSlotsWithCursor(
-        self: *Self,
-        buf: []GossipVersionedData,
-        caller_cursor: *usize,
-    ) ![]GossipVersionedData {
-        return genericGetWithCursor(
-            self.epoch_slots,
-            self.store,
-            buf,
-            caller_cursor,
-        );
-    }
-
-    pub fn getDuplicateShredsWithCursor(
-        self: *Self,
-        buf: []GossipVersionedData,
-        caller_cursor: *usize,
-    ) ![]GossipVersionedData {
-        return genericGetWithCursor(
-            self.duplicate_shreds,
-            self.store,
-            buf,
-            caller_cursor,
-        );
+    /// Same as getContactInfos, but returns a slice of ThreadSafeContactInfos.
+    /// It should be used in favour of getContactInfos whenever the result crosses
+    /// a table lock boundary.
+    pub fn getThreadSafeContactInfos(
+        self: *const Self,
+        buf: []ThreadSafeContactInfo,
+        minimum_insertion_timestamp: u64,
+    ) []ThreadSafeContactInfo {
+        var infos = self.contactInfoIterator(minimum_insertion_timestamp);
+        var i: usize = 0;
+        while (infos.next()) |info| {
+            if (i >= buf.len) break;
+            buf[i] = ThreadSafeContactInfo.fromContactInfo(info.*);
+            i += 1;
+        }
+        return buf[0..i];
     }
 
     /// Returns a slice of contact infos that are no older than minimum_insertion_timestamp.
@@ -583,9 +584,7 @@ pub const GossipTable = struct {
     /// TODO: implement a safer approach to avoid dangling pointers, such as:
     ///  - removal buffer that is populated here and freed later
     ///  - reference counting for all gossip values
-    pub fn remove(self: *Self, label: GossipKey) error{ LabelNotFound, OutOfMemory }!void {
-        const now = getWallclockMs();
-
+    pub fn remove(self: *Self, label: GossipKey, now: u64) error{ LabelNotFound, OutOfMemory }!void {
         const maybe_entry = self.store.getEntry(label);
         if (maybe_entry == null) return error.LabelNotFound;
 
@@ -648,6 +647,13 @@ pub const GossipTable = struct {
             const did_remove = self.entries.swapRemove(versioned_value.cursor_on_insertion);
             std.debug.assert(did_remove);
         }
+
+        // free memory while versioned_value still points to the correct data
+        versioned_value.value.data.deinit(self.allocator);
+
+        // remove from store
+        // this operation replaces the data pointed to by versioned_value to
+        // either the last element of the store, or undefined if the store is empty
         {
             const did_remove = self.store.swapRemove(label);
             std.debug.assert(did_remove);
@@ -658,14 +664,14 @@ pub const GossipTable = struct {
         // if (index == table_len) then it was already the last
         // element so we dont need to do anything
         if (entry_index < table_len) {
-            const new_index_value = self.store.iterator().values[entry_index];
-            const new_index_cursor = new_index_value.cursor_on_insertion;
-            const new_index_origin = new_index_value.value.id();
+            // versioned data now points to the element which was swapped in and needs updating
+            const new_index_cursor = versioned_value.cursor_on_insertion;
+            const new_index_origin = versioned_value.value.id();
 
             // update shards
-            self.shards.remove(table_len, &new_index_value.value_hash);
+            self.shards.remove(table_len, &versioned_value.value_hash);
             // wont fail because we just removed a value in line above
-            self.shards.insert(entry_index, &new_index_value.value_hash) catch unreachable;
+            self.shards.insert(entry_index, &versioned_value.value_hash) catch unreachable;
 
             // these also should not fail since there are no allocations - just changing the value
             switch (versioned_value.value.data) {
@@ -697,7 +703,6 @@ pub const GossipTable = struct {
             std.debug.assert(did_remove);
             new_entry_indexs.put(entry_index, {}) catch unreachable;
         }
-        bincode.free(self.allocator, versioned_value.value.data);
     }
 
     /// Trim when over 90% of max capacity
@@ -706,8 +711,12 @@ pub const GossipTable = struct {
         return (10 * n_pubkeys > 9 * max_pubkey_capacity);
     }
 
-    pub fn attemptTrim(self: *Self, max_pubkey_capacity: usize) error{OutOfMemory}!void {
-        if (!self.shouldTrim(max_pubkey_capacity)) return;
+    /// removes pubkeys and their associated values until the pubkey count is less than max_pubkey_capacity.
+    /// returns the number of pubkeys removed.
+    ///
+    /// NOTE: the `now` parameter is used to populate the purged field with the timestamp of the removal.
+    pub fn attemptTrim(self: *Self, now: u64, max_pubkey_capacity: usize) error{OutOfMemory}!u64 {
+        if (!self.shouldTrim(max_pubkey_capacity)) return 0;
 
         const n_pubkeys = self.pubkey_to_values.count();
         const drop_size = n_pubkeys -| max_pubkey_capacity;
@@ -729,22 +738,26 @@ pub const GossipTable = struct {
         }
 
         for (labels_to_remove.items) |label| {
-            self.remove(label) catch unreachable;
+            self.remove(label, now) catch unreachable;
         }
+
+        return drop_pubkeys.len;
     }
 
     pub fn removeOldLabels(
         self: *Self,
         now: u64,
         timeout: u64,
-    ) error{OutOfMemory}!void {
+    ) error{OutOfMemory}!u64 {
         const old_labels = try self.getOldLabels(now, timeout);
         defer old_labels.deinit();
 
         for (old_labels.items) |old_label| {
             // unreachable: label should always exist in store
-            self.remove(old_label) catch unreachable;
+            self.remove(old_label, now) catch unreachable;
         }
+
+        return old_labels.items.len;
     }
 
     const GetOldLabelsTask = struct {
@@ -947,7 +960,7 @@ test "gossip.table: remove old values" {
             &keypair,
         );
         // TS = 100
-        try table.insert(value, 100);
+        _ = try table.insert(value, 100);
     }
     try std.testing.expect(table.len() == 5);
 
@@ -956,7 +969,7 @@ test "gossip.table: remove old values" {
     defer values.deinit();
     // remove all values
     for (values.items) |value| {
-        try table.remove(value);
+        try table.remove(value, 200);
     }
 
     try std.testing.expectEqual(table.len(), 0);
@@ -976,10 +989,10 @@ test "gossip.table: insert and remove value" {
         GossipData.randomFromIndex(rng.random(), 0),
         &keypair,
     );
-    try table.insert(value, 100);
+    _ = try table.insert(value, 100);
 
     const label = value.label();
-    try table.remove(label);
+    try table.remove(label, 100);
 }
 
 test "gossip.table: trim pruned values" {
@@ -1003,7 +1016,7 @@ test "gossip.table: trim pruned values" {
             GossipData.random(rng.random()),
             &keypair,
         );
-        try table.insert(value, 100);
+        _ = try table.insert(value, 100);
         try values.append(value);
     }
     try std.testing.expectEqual(table.len(), N_VALUES);
@@ -1015,13 +1028,13 @@ test "gossip.table: trim pruned values" {
         _ = table.pubkey_to_values.get(origin).?;
     }
 
-    try table.attemptTrim(N_TRIM_VALUES);
+    _ = try table.attemptTrim(0, N_TRIM_VALUES);
 
     try std.testing.expectEqual(table.len(), N_VALUES - N_TRIM_VALUES);
     try std.testing.expectEqual(table.pubkey_to_values.count(), N_VALUES - N_TRIM_VALUES);
     try std.testing.expectEqual(table.purged.len(), N_TRIM_VALUES);
 
-    try table.attemptTrim(0);
+    _ = try table.attemptTrim(0, 0);
     try std.testing.expectEqual(table.len(), 0);
 }
 
@@ -1063,7 +1076,7 @@ test "gossip.HashTimeQueue: trim pruned values" {
     defer table.deinit();
 
     // timestamp = 100
-    try table.insert(value, 100);
+    _ = try table.insert(value, 100);
 
     // should lead to prev being pruned
     var new_data = GossipData{
@@ -1073,7 +1086,7 @@ test "gossip.HashTimeQueue: trim pruned values" {
     // older wallclock
     new_data.LegacyContactInfo.wallclock += data.LegacyContactInfo.wallclock;
     value = try SignedGossipData.initSigned(new_data, &keypair);
-    try table.insert(value, 120);
+    _ = try table.insert(value, 120);
 
     try std.testing.expectEqual(table.purged.len(), 1);
 
@@ -1095,53 +1108,11 @@ test "gossip.table: insert and get" {
     var table = try GossipTable.init(std.testing.allocator, &tp);
     defer table.deinit();
 
-    try table.insert(value, 0);
+    _ = try table.insert(value, 0);
 
     const label = value.label();
     const x = table.get(label).?;
     _ = x;
-}
-
-test "gossip.table: insert and get votes" {
-    const kp_bytes = [_]u8{1} ** 32;
-    const kp = try KeyPair.create(kp_bytes);
-    const pk = kp.public_key;
-    var id = Pubkey.fromPublicKey(&pk);
-
-    var vote = Vote{ .from = id, .transaction = Transaction.default(), .wallclock = 10 };
-    var gossip_value = try SignedGossipData.initSigned(GossipData{
-        .Vote = .{ 0, vote },
-    }, &kp);
-
-    var tp = ThreadPool.init(.{});
-    var table = try GossipTable.init(std.testing.allocator, &tp);
-    defer table.deinit();
-    try table.insert(gossip_value, 0);
-
-    var cursor: usize = 0;
-    var buf: [100]GossipVersionedData = undefined;
-    var votes = try table.getVotesWithCursor(&buf, &cursor);
-
-    try std.testing.expect(votes.len == 1);
-    try std.testing.expect(cursor == 1);
-
-    // try inserting another vote
-    const seed: u64 = @intCast(std.time.milliTimestamp());
-    var rand = std.rand.DefaultPrng.init(seed);
-    const rng = rand.random();
-    id = Pubkey.random(rng);
-    vote = Vote{ .from = id, .transaction = Transaction.default(), .wallclock = 10 };
-    gossip_value = try SignedGossipData.initSigned(GossipData{
-        .Vote = .{ 0, vote },
-    }, &kp);
-    try table.insert(gossip_value, 1);
-
-    votes = try table.getVotesWithCursor(&buf, &cursor);
-    try std.testing.expect(votes.len == 1);
-    try std.testing.expect(cursor == 2);
-
-    const v = try table.getBitmaskMatches(std.testing.allocator, 10, 1);
-    defer v.deinit();
 }
 
 test "gossip.table: insert and get contact_info" {
@@ -1158,7 +1129,7 @@ test "gossip.table: insert and get contact_info" {
     defer table.deinit();
 
     // test insertion
-    try table.insert(gossip_value, 0);
+    _ = try table.insert(gossip_value, 0);
 
     // test retrieval
     var buf: [100]ContactInfo = undefined;
@@ -1168,12 +1139,12 @@ test "gossip.table: insert and get contact_info" {
 
     // test re-insertion
     const result = table.insert(gossip_value, 0);
-    try std.testing.expectError(TableError.DuplicateValue, result);
+    try std.testing.expectError(GossipTable.InsertionError.DuplicateValue, result);
 
     // test re-insertion with greater wallclock
     gossip_value.data.LegacyContactInfo.wallclock += 2;
     const v = gossip_value.data.LegacyContactInfo.wallclock;
-    try table.insert(gossip_value, 0);
+    _ = try table.insert(gossip_value, 0);
 
     // check retrieval
     nodes = table.getContactInfos(&buf, 0);

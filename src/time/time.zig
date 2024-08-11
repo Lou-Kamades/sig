@@ -406,9 +406,7 @@ pub const DateTime = struct {
     };
 
     pub fn since(self: Self, other_in_the_past: Self) Duration {
-        return Duration{
-            .ms = self.toUnixMilli() - other_in_the_past.toUnixMilli(),
-        };
+        return Duration.fromMillis(self.toUnixMilli() - other_in_the_past.toUnixMilli());
     }
 };
 
@@ -495,5 +493,87 @@ fn wrap(val: u16, at: u16) u16 {
 }
 
 pub const Duration = struct {
-    ms: u64,
+    ns: u64,
+
+    pub fn zero() Duration {
+        return .{ .ns = 0 };
+    }
+
+    pub fn fromSecs(s: u64) Duration {
+        return .{ .ns = s * std.time.ns_per_s };
+    }
+
+    pub fn fromMillis(ms: u64) Duration {
+        return .{ .ns = ms * std.time.ns_per_ms };
+    }
+
+    pub fn fromMicros(us: u64) Duration {
+        return .{ .ns = us * std.time.ns_per_us };
+    }
+
+    pub fn fromNanos(ns: u64) Duration {
+        return .{ .ns = ns };
+    }
+
+    pub fn asSecs(self: Duration) u64 {
+        return self.ns / std.time.ns_per_s;
+    }
+
+    pub fn asMillis(self: Duration) u64 {
+        return self.ns / std.time.ns_per_ms;
+    }
+
+    pub fn asMicros(self: Duration) u64 {
+        return self.ns / std.time.ns_per_us;
+    }
+
+    pub fn asNanos(self: Duration) u64 {
+        return self.ns;
+    }
+
+    pub fn gt(self: Duration, other: Duration) bool {
+        return self.ns > other.ns;
+    }
+
+    pub fn gte(self: Duration, other: Duration) bool {
+        return self.ns >= other.ns;
+    }
+
+    pub fn lt(self: Duration, other: Duration) bool {
+        return self.ns < other.ns;
+    }
+
+    pub fn lte(self: Duration, other: Duration) bool {
+        return self.ns <= other.ns;
+    }
+
+    pub fn eql(self: Duration, other: Duration) bool {
+        return self.ns == other.ns;
+    }
+};
+
+pub const Timer = struct {
+    inner: std.time.Timer,
+
+    pub const Error = std.time.Timer.Error;
+
+    pub fn start() Error!Timer {
+        return .{ .inner = try std.time.Timer.start() };
+    }
+
+    pub fn read(self: *Timer) Duration {
+        return Duration.fromNanos(self.inner.read());
+    }
+
+    pub fn reset(self: *Timer) void {
+        self.inner.reset();
+    }
+
+    pub fn lap(self: *Timer) Duration {
+        return Duration.fromNanos(self.inner.lap());
+    }
+
+    pub fn sample(self: *Timer) std.time.Instant {
+        return self.inner.sample();
+    }
 };

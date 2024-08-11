@@ -1,18 +1,21 @@
+//! logic for downloading a snapshot
+
 const std = @import("std");
 const curl = @import("curl");
-const Pubkey = @import("../core/pubkey.zig").Pubkey;
-const gossip = @import("../gossip/service.zig");
-const GossipService = gossip.GossipService;
-const ContactInfo = @import("../gossip/data.zig").ContactInfo;
-const GossipTable = @import("../gossip/table.zig").GossipTable;
-const SlotAndHash = @import("./snapshots.zig").SlotAndHash;
-const Logger = @import("../trace/log.zig").Logger;
-const Hash = @import("../core/hash.zig").Hash;
+const sig = @import("../lib.zig");
+
+const SlotAndHash = sig.accounts_db.snapshots.SlotAndHash;
+const Pubkey = sig.core.Pubkey;
+const GossipTable = sig.gossip.GossipTable;
+const ThreadSafeContactInfo = sig.gossip.data.ThreadSafeContactInfo;
+const GossipService = sig.gossip.GossipService;
+const Logger = sig.trace.Logger;
 
 const DOWNLOAD_PROGRESS_UPDATES_NS = 30 * std.time.ns_per_s;
 
+/// Analogous to [PeerSnapshotHash](https://github.com/anza-xyz/agave/blob/f868aa38097094e4fb78a885b6fb27ce0e43f5c7/validator/src/bootstrap.rs#L342)
 const PeerSnapshotHash = struct {
-    contact_info: ContactInfo,
+    contact_info: ThreadSafeContactInfo,
     full_snapshot: SlotAndHash,
     inc_snapshot: ?SlotAndHash,
 };
@@ -38,7 +41,7 @@ const PeerSearchResult = struct {
 pub fn findPeersToDownloadFromAssumeCapacity(
     allocator: std.mem.Allocator,
     table: *const GossipTable,
-    contact_infos: []const ContactInfo,
+    contact_infos: []const ThreadSafeContactInfo,
     my_shred_version: usize,
     my_pubkey: Pubkey,
     blacklist: []const Pubkey,
@@ -95,10 +98,10 @@ pub fn findPeersToDownloadFromAssumeCapacity(
             result.invalid_shred_version += 1;
             continue;
         }
-        _ = peer_contact_info.getSocket(.rpc) orelse {
+        if (peer_contact_info.rpc_addr == null) {
             result.no_rpc_count += 1;
             continue;
-        };
+        }
         const gossip_data = table.get(.{ .SnapshotHashes = peer_contact_info.pubkey }) orelse {
             result.no_snapshot_hashes_count += 1;
             continue;
@@ -140,7 +143,6 @@ pub fn findPeersToDownloadFromAssumeCapacity(
         }
 
         valid_peers.appendAssumeCapacity(.{
-            // NOTE: maybe we need to deep clone here due to arraylist sockets?
             .contact_info = peer_contact_info.*,
             .full_snapshot = snapshot_hashes.full,
             .inc_snapshot = max_inc_hash,
@@ -159,13 +161,13 @@ pub fn downloadSnapshotsFromGossip(
     // if null, then we trust any peer for snapshot download
     maybe_trusted_validators: ?[]const Pubkey,
     gossip_service: *GossipService,
-    output_dir: []const u8,
+    output_dir: std.fs.Dir,
     min_mb_per_sec: usize,
 ) !void {
     logger.infof("starting snapshot download with min download speed: {d} MB/s", .{min_mb_per_sec});
 
     // TODO: maybe make this bigger? or dynamic?
-    var contact_info_buf: [1_000]ContactInfo = undefined;
+    var contact_info_buf: [1_000]ThreadSafeContactInfo = undefined;
 
     const my_contact_info = gossip_service.my_contact_info;
 
@@ -184,7 +186,7 @@ pub fn downloadSnapshotsFromGossip(
             defer lg.unlock();
             const table: *const GossipTable = lg.get();
 
-            const contacts = table.getContactInfos(&contact_info_buf, 0);
+            const contacts = table.getThreadSafeContactInfos(&contact_info_buf, 0);
 
             try available_snapshot_peers.ensureTotalCapacity(contacts.len);
             const result = try findPeersToDownloadFromAssumeCapacity(
@@ -211,7 +213,7 @@ pub fn downloadSnapshotsFromGossip(
             });
             defer allocator.free(snapshot_filename);
 
-            const rpc_socket = peer.contact_info.getSocket(.rpc).?;
+            const rpc_socket = peer.contact_info.rpc_addr.?;
             const rpc_url_bounded = rpc_socket.toStringBounded();
             const rpc_url = rpc_url_bounded.constSlice();
 
@@ -293,13 +295,12 @@ const DownloadProgress = struct {
 
     pub fn init(
         logger: Logger,
-        output_dir_str: []const u8,
+        output_dir: std.fs.Dir,
         filename: []const u8,
         download_size: usize,
         min_mb_per_second: ?usize,
     ) !Self {
-        var output_dir = try std.fs.cwd().openDir(output_dir_str, .{});
-        var file = try output_dir.createFile(filename, .{ .read = true });
+        const file = try output_dir.createFile(filename, .{ .read = true });
         defer file.close();
 
         // resize the file
@@ -404,7 +405,7 @@ pub fn downloadFile(
     allocator: std.mem.Allocator,
     logger: Logger,
     url: [:0]const u8,
-    output_dir_str: []const u8,
+    output_dir: std.fs.Dir,
     filename: []const u8,
     min_mb_per_second: ?usize,
 ) !void {
@@ -430,18 +431,12 @@ pub fn downloadFile(
     easy.timeout_ms = std.time.ms_per_hour * 5; // 5 hours is probs too long but its ok
     var download_progress = try DownloadProgress.init(
         logger,
-        output_dir_str,
+        output_dir,
         filename,
         download_size,
         min_mb_per_second,
     );
-    errdefer {
-        // NOTE: this shouldnt fail because we open the dir in DownloadProgress.init
-        const output_dir = std.fs.cwd().openDir(output_dir_str, .{}) catch {
-            std.debug.panic("failed to open output dir: {s}", .{output_dir_str});
-        };
-        output_dir.deleteFile(filename) catch {};
-    }
+    errdefer output_dir.deleteFile(filename) catch {};
     defer download_progress.deinit();
 
     try setNoBody(easy, false); // full download
@@ -460,9 +455,10 @@ pub fn downloadFile(
     }
 }
 
-const ThreadPool = @import("../sync/thread_pool.zig").ThreadPool;
-const LegacyContactInfo = @import("../gossip/data.zig").LegacyContactInfo;
-const SignedGossipData = @import("../gossip/data.zig").SignedGossipData;
+const ThreadPool = sig.sync.thread_pool.ThreadPool;
+const LegacyContactInfo = sig.gossip.data.LegacyContactInfo;
+const SignedGossipData = sig.gossip.data.SignedGossipData;
+
 const KeyPair = std.crypto.sign.Ed25519.KeyPair;
 
 test "accounts_db.download: test remove untrusted peers" {
@@ -477,16 +473,13 @@ test "accounts_db.download: test remove untrusted peers" {
     const my_shred_version: usize = 19;
     const my_pubkey = Pubkey.random(rng);
 
-    const contact_infos: []ContactInfo = try allocator.alloc(ContactInfo, 10);
-    defer {
-        for (contact_infos) |ci| ci.deinit();
-        allocator.free(contact_infos);
-    }
+    const contact_infos: []ThreadSafeContactInfo = try allocator.alloc(ThreadSafeContactInfo, 10);
+    defer allocator.free(contact_infos);
 
     for (contact_infos) |*ci| {
         var lci = LegacyContactInfo.default(Pubkey.random(rng));
         lci.rpc.setPort(19); // no long unspecified = valid
-        ci.* = try lci.toContactInfo(allocator);
+        ci.* = ThreadSafeContactInfo.fromLegacyContactInfo(lci);
         ci.shred_version = 19; // matching shred version
     }
 
@@ -501,7 +494,7 @@ test "accounts_db.download: test remove untrusted peers" {
         var data = try SignedGossipData.randomWithIndex(rng, &kp, 9);
         data.data.SnapshotHashes.from = ci.pubkey;
         try trusted_validators.append(ci.pubkey);
-        try table.insert(data, 0);
+        _ = try table.insert(data, 0);
     }
 
     _ = try findPeersToDownloadFromAssumeCapacity(
@@ -556,16 +549,13 @@ test "accounts_db.download: test finding peers" {
     const my_shred_version: usize = 19;
     const my_pubkey = Pubkey.random(rng);
 
-    const contact_infos: []ContactInfo = try allocator.alloc(ContactInfo, 10);
-    defer {
-        for (contact_infos) |ci| ci.deinit();
-        allocator.free(contact_infos);
-    }
+    const contact_infos: []ThreadSafeContactInfo = try allocator.alloc(ThreadSafeContactInfo, 10);
+    defer allocator.free(contact_infos);
 
     for (contact_infos) |*ci| {
         var lci = LegacyContactInfo.default(Pubkey.random(rng));
         lci.rpc.setPort(19); // no long unspecified = valid
-        ci.* = try lci.toContactInfo(allocator);
+        ci.* = ThreadSafeContactInfo.fromLegacyContactInfo(lci);
         ci.shred_version = 19; // matching shred version
     }
 
@@ -595,7 +585,7 @@ test "accounts_db.download: test finding peers" {
         var kp = try KeyPair.create(null);
         var data = try SignedGossipData.randomWithIndex(rng, &kp, 9);
         data.data.SnapshotHashes.from = ci.pubkey;
-        try table.insert(data, 0);
+        _ = try table.insert(data, 0);
     }
 
     result = try findPeersToDownloadFromAssumeCapacity(

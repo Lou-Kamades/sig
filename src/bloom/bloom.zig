@@ -4,13 +4,10 @@ const sig = @import("../lib.zig");
 const testing = std.testing;
 const bincode = sig.bincode;
 
-const RndGen = std.rand.DefaultPrng;
 const ArrayList = std.ArrayList;
 
 const DynamicArrayBitSet = sig.bloom.bit_set.DynamicArrayBitSet;
-const BitVec = sig.bloom.bit_vec.BitVec;
 const BitVecConfig = sig.bloom.bit_vec.BitVecConfig;
-const ArrayListConfig = bincode.arraylist.ArrayListConfig;
 const FnvHasher = sig.crypto.FnvHasher;
 
 /// A bloom filter whose bitset is made up of u64 blocks
@@ -19,7 +16,6 @@ pub const Bloom = struct {
     bits: DynamicArrayBitSet(u64),
     num_bits_set: u64,
 
-    pub const @"!bincode-config:keys" = ArrayListConfig(u64);
     pub const @"!bincode-config:bits" = BitVecConfig(u64);
 
     const Self = @This();

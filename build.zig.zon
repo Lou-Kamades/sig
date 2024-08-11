@@ -24,12 +24,16 @@
             .hash = "1220b8a918dfcee4fc8326ec337776e2ffd3029511c35f6b96d10aa7be98ca2faf99",
         },
         .zstd = .{
-            .url = "https://github.com/Syndica/zstd.zig/archive/a052e839a3dfc44feb00c2eb425815baa3c76e0d.tar.gz",
-            .hash = "122001d56e43ef94e31243739ae83d7508abf0b8102795aff1ac91446e7ff450d875",
+            .url = "https://github.com/Syndica/zstd.zig/archive/b5078c9da8588d4b133ed93b6b13c01288346be5.tar.gz",
+            .hash = "1220409db8254e909be7277ec0ef0e26bf3f9daf089dcc5f8bb24c473ddc2adc9dfa",
         },
         .curl = .{
             .url = "https://github.com/jiacai2050/zig-curl/archive/8a3f45798a80a5de4c11c6fa44dab8785c421d27.tar.gz",
             .hash = "1220f70ac854b59315a8512861e039648d677feb4f9677bd873d6b9b7074a5906485",
+        },
+        .rocksdb = .{
+            .url = "https://github.com/Syndica/rocksdb-zig/archive/21ac0ae13c9ac38706e6b76117f32bab5158d71f.tar.gz",
+            .hash = "12207bec9b5a101d0ec476fb2bb8877b15afb6cb6edc5c98851be7e3e193d15e5759",
         },
     },
 }

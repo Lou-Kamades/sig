@@ -2,6 +2,8 @@ const std = @import("std");
 const Build = std.Build;
 
 pub fn build(b: *Build) void {
+    defer makeZlsNotInstallAnythingDuringBuildOnSave(b);
+
     // CLI options
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -34,6 +36,9 @@ pub fn build(b: *Build) void {
     const curl_dep = b.dependency("curl", dep_opts);
     const curl_mod = curl_dep.module("curl");
 
+    const rocksdb_dep = b.dependency("rocksdb", dep_opts);
+    const rocksdb_mod = rocksdb_dep.module("rocksdb-bindings");
+
     // expose Sig as a module
     const sig_mod = b.addModule("sig", .{
         .root_source_file = b.path("src/lib.zig"),
@@ -44,6 +49,7 @@ pub fn build(b: *Build) void {
     sig_mod.addImport("httpz", httpz_mod);
     sig_mod.addImport("zstd", zstd_mod);
     sig_mod.addImport("curl", curl_mod);
+    sig_mod.addImport("rocksdb", rocksdb_mod);
 
     // main executable
     const sig_exe = b.addExecutable(.{
@@ -59,6 +65,7 @@ pub fn build(b: *Build) void {
     sig_exe.root_module.addImport("zig-cli", zig_cli_module);
     sig_exe.root_module.addImport("zig-network", zig_network_module);
     sig_exe.root_module.addImport("zstd", zstd_mod);
+    sig_exe.root_module.addImport("rocksdb", rocksdb_mod);
 
     const main_exe_run = b.addRunArtifact(sig_exe);
     main_exe_run.addArgs(b.args orelse &.{});
@@ -77,6 +84,7 @@ pub fn build(b: *Build) void {
     unit_tests_exe.root_module.addImport("httpz", httpz_mod);
     unit_tests_exe.root_module.addImport("zig-network", zig_network_module);
     unit_tests_exe.root_module.addImport("zstd", zstd_mod);
+    unit_tests_exe.root_module.addImport("rocksdb", rocksdb_mod);
 
     const unit_tests_exe_run = b.addRunArtifact(unit_tests_exe);
     test_step.dependOn(&unit_tests_exe_run.step);
@@ -92,6 +100,7 @@ pub fn build(b: *Build) void {
     fuzz_exe.root_module.addImport("base58-zig", base58_module);
     fuzz_exe.root_module.addImport("zig-network", zig_network_module);
     fuzz_exe.root_module.addImport("httpz", httpz_mod);
+    fuzz_exe.root_module.addImport("zstd", zstd_mod);
 
     const fuzz_exe_run = b.addRunArtifact(fuzz_exe);
     fuzz_exe_run.addArgs(b.args orelse &.{});
@@ -113,4 +122,23 @@ pub fn build(b: *Build) void {
     const benchmark_exe_run = b.addRunArtifact(benchmark_exe);
     benchmark_exe_run.addArgs(b.args orelse &.{});
     benchmark_step.dependOn(&benchmark_exe_run.step);
+}
+
+/// Reference/inspiration: https://kristoff.it/blog/improving-your-zls-experience/
+fn makeZlsNotInstallAnythingDuringBuildOnSave(b: *Build) void {
+    const zls_is_build_runner = b.option(bool, "zls-is-build-runner", "" ++
+        "Option passed by zls to indicate that it's the one running this build script (configured in the local zls.json). " ++
+        "This should not be specified on the command line nor as a dependency argument.") orelse false;
+    if (!zls_is_build_runner) return;
+
+    for (b.install_tls.step.dependencies.items) |*install_step_dep| {
+        const install_artifact = install_step_dep.*.cast(Build.Step.InstallArtifact) orelse continue;
+        const artifact = install_artifact.artifact;
+        install_step_dep.* = &artifact.step;
+        // this will make it so `-fno-emit-bin` is passed, meaning
+        // that the compiler will only go as far as semantically
+        // analyzing the code, without sending it to any backend,
+        // namely the slow-to-compile LLVM.
+        artifact.generated_bin = null;
+    }
 }

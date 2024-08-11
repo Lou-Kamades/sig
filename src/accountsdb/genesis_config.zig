@@ -1,3 +1,5 @@
+//! genesis config fields
+
 const std = @import("std");
 const AutoHashMap = std.AutoHashMap;
 const Account = @import("../core/account.zig").Account;
@@ -15,6 +17,7 @@ pub const RustDuration = struct {
     nanos: u32,
 };
 
+/// Analogous to [PohConfig](https://github.com/anza-xyz/agave/blob/cadba689cb44db93e9c625770cafd2fc0ae89e33/sdk/src/poh_config.rs#L10)
 pub const PohConfig = struct {
     /// The target tick rate of the cluster.
     target_tick_duration: RustDuration,
@@ -28,29 +31,42 @@ pub const PohConfig = struct {
     hashes_per_tick: ?u64,
 };
 
+/// Analogous to [FeeRateGovernor](https://github.com/anza-xyz/agave/blob/ec9bd798492c3b15d62942f2d9b5923b99042350/sdk/program/src/fee_calculator.rs#L55)
 pub const FeeRateGovernor = struct {
-    // The current cost of a signature  This amount may increase/decrease over time based on
-    // cluster processing load.
+    /// The current cost of a signature  This amount may increase/decrease over time based on
+    /// cluster processing load.
     lamports_per_signature: u64 = 0,
 
-    // The target cost of a signature when the cluster is operating around target_signatures_per_slot
-    // signatures
+    /// The target cost of a signature when the cluster is operating around target_signatures_per_slot
+    /// signatures.
     target_lamports_per_signature: u64,
 
-    // Used to estimate the desired processing capacity of the cluster.  As the signatures for
-    // recent slots are fewer/greater than this value, lamports_per_signature will decrease/increase
-    // for the next slot.  A value of 0 disables lamports_per_signature fee adjustments
+    /// Used to estimate the desired processing capacity of the cluster.  As the signatures for
+    /// recent slots are fewer/greater than this value, lamports_per_signature will decrease/increase
+    /// for the next slot.  A value of 0 disables lamports_per_signature fee adjustments.
     target_signatures_per_slot: u64,
 
     min_lamports_per_signature: u64,
     max_lamports_per_signature: u64,
 
-    // What portion of collected fees are to be destroyed, as a fraction of std::u8::MAX
+    /// What portion of collected fees are to be destroyed, as a fraction of std::u8::MAX.
     burn_percent: u8,
 
     pub const @"!bincode-config:lamports_per_signature" = bincode.FieldConfig(u64){ .skip = true };
+
+    pub fn random(rand: std.Random) FeeRateGovernor {
+        return .{
+            .lamports_per_signature = rand.int(u64),
+            .target_lamports_per_signature = rand.int(u64),
+            .target_signatures_per_slot = rand.int(u64),
+            .min_lamports_per_signature = rand.int(u64),
+            .max_lamports_per_signature = rand.int(u64),
+            .burn_percent = rand.uintAtMost(u8, 100),
+        };
+    }
 };
 
+/// Analogous to [Rent](https://github.com/anza-xyz/agave/blob/5a9906ebf4f24cd2a2b15aca638d609ceed87797/sdk/program/src/rent.rs#L13)
 pub const Rent = extern struct {
     /// Rental rate in lamports/byte-year.
     lamports_per_byte_year: u64,
@@ -64,8 +80,17 @@ pub const Rent = extern struct {
     /// Valid values are in the range [0, 100]. The remaining percentage is
     /// distributed to validators.
     burn_percent: u8,
+
+    pub fn random(rand: std.Random) Rent {
+        return .{
+            .lamports_per_byte_year = rand.int(u64),
+            .exemption_threshold = @bitCast(rand.int(u64)),
+            .burn_percent = rand.uintAtMost(u8, 100),
+        };
+    }
 };
 
+/// Analogous to [Inflation](https://github.com/anza-xyz/agave/blob/55aff7288e596e93d1184ba827048b1e3dc98061/sdk/src/inflation.rs#L6)
 pub const Inflation = struct {
     /// Initial inflation percentage, from time=0
     initial: f64,
@@ -84,8 +109,20 @@ pub const Inflation = struct {
 
     /// DEPRECATED, this field is currently unused
     __unused: f64,
+
+    pub fn random(rand: std.Random) Inflation {
+        return .{
+            .initial = @bitCast(rand.int(u64)),
+            .terminal = @bitCast(rand.int(u64)),
+            .taper = @bitCast(rand.int(u64)),
+            .foundation = @bitCast(rand.int(u64)),
+            .foundation_term = @bitCast(rand.int(u64)),
+            .__unused = @bitCast(rand.int(u64)),
+        };
+    }
 };
 
+/// Analogous to [EpochSchedule](https://github.com/anza-xyz/agave/blob/5a9906ebf4f24cd2a2b15aca638d609ceed87797/sdk/program/src/epoch_schedule.rs#L35)
 pub const EpochSchedule = extern struct {
     /// The maximum number of slots in each epoch.
     slots_per_epoch: u64,
@@ -143,8 +180,19 @@ pub const EpochSchedule = extern struct {
         else
             self.slots_per_epoch;
     }
+
+    pub fn random(rand: std.Random) EpochSchedule {
+        return .{
+            .slots_per_epoch = rand.int(u64),
+            .leader_schedule_slot_offset = rand.int(u64),
+            .warmup = rand.boolean(),
+            .first_normal_epoch = rand.int(Epoch),
+            .first_normal_slot = rand.int(Slot),
+        };
+    }
 };
 
+/// Analogous to [ClusterType](https://github.com/anza-xyz/agave/blob/cadba689cb44db93e9c625770cafd2fc0ae89e33/sdk/src/genesis_config.rs#L46)
 pub const ClusterType = enum(u8) {
     Testnet,
     MainnetBeta,
@@ -152,6 +200,7 @@ pub const ClusterType = enum(u8) {
     Development,
 };
 
+/// Analogous to [GenesisConfig](https://github.com/anza-xyz/agave/blob/cadba689cb44db93e9c625770cafd2fc0ae89e33/sdk/src/genesis_config.rs#L93)
 pub const GenesisConfig = struct {
     // when the network (bootstrap validator) was started relative to the UNIX Epoch
     creation_time: UnixTimestamp,
@@ -185,9 +234,7 @@ pub const GenesisConfig = struct {
     ) !GenesisConfig {
         var file = try std.fs.cwd().openFile(genesis_path, .{});
         defer file.close();
-        const config = try bincode.read(allocator, GenesisConfig, file.reader(), .{});
-
-        return config;
+        return try bincode.read(allocator, GenesisConfig, file.reader(), .{});
     }
 
     pub fn deinit(self: GenesisConfig, allocator: std.mem.Allocator) void {
@@ -195,7 +242,7 @@ pub const GenesisConfig = struct {
     }
 };
 
-test "core.genesis_config: deserialize config" {
+test "genesis_config deserialize development config" {
     const allocator = std.testing.allocator;
 
     const genesis_path = "./test_data/genesis.bin";
@@ -203,4 +250,34 @@ test "core.genesis_config: deserialize config" {
     defer config.deinit(allocator);
 
     try std.testing.expect(config.cluster_type == ClusterType.Development);
+}
+
+test "genesis_config deserialize testnet config" {
+    const allocator = std.testing.allocator;
+
+    const genesis_path = "./genesis-files/testnet-genesis.bin";
+    const config = try GenesisConfig.init(allocator, genesis_path);
+    defer config.deinit(allocator);
+
+    try std.testing.expect(config.cluster_type == ClusterType.Testnet);
+}
+
+test "genesis_config deserialize devnet config" {
+    const allocator = std.testing.allocator;
+
+    const genesis_path = "./genesis-files/devnet-genesis.bin";
+    const config = try GenesisConfig.init(allocator, genesis_path);
+    defer config.deinit(allocator);
+
+    try std.testing.expect(config.cluster_type == ClusterType.Devnet);
+}
+
+test "genesis_config deserialize mainnet config" {
+    const allocator = std.testing.allocator;
+
+    const genesis_path = "./genesis-files/mainnet-genesis.bin";
+    const config = try GenesisConfig.init(allocator, genesis_path);
+    defer config.deinit(allocator);
+
+    try std.testing.expect(config.cluster_type == ClusterType.MainnetBeta);
 }
