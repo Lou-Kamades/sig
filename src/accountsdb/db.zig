@@ -2879,13 +2879,13 @@ pub const BenchmarkAccountsDB = struct {
     };
 
     pub const args = [_]BenchArgs{
-        BenchArgs{
-            .n_accounts = 100_000,
-            .slot_list_len = 1,
-            .accounts = .ram,
-            .index = .ram,
-            .name = "100k accounts (1_slot - ram index - ram accounts)",
-        },
+        // BenchArgs{
+        //     .n_accounts = 100_000,
+        //     .slot_list_len = 1,
+        //     .accounts = .ram,
+        //     .index = .ram,
+        //     .name = "100k accounts (1_slot - ram index - ram accounts)",
+        // },
         // BenchArgs{
         //     .n_accounts = 100_000,
         //     .slot_list_len = 1,
@@ -2893,20 +2893,20 @@ pub const BenchmarkAccountsDB = struct {
         //     .index = .disk,
         //     .name = "100k accounts (1_slot - disk index - ram accounts)",
         // },
-        // BenchArgs{
-        //     .n_accounts = 100_000,
-        //     .slot_list_len = 1,
-        //     .accounts = .disk,
-        //     .index = .ram,
-        //     .name = "100k accounts (1_slot - ram index - disk accounts)",
-        // },
-        // BenchArgs{
-        //     .n_accounts = 100_000,
-        //     .slot_list_len = 1,
-        //     .accounts = .disk,
-        //     .index = .disk,
-        //     .name = "100k accounts (1_slot - disk index - disk accounts)",
-        // },
+        BenchArgs{
+            .n_accounts = 100_000,
+            .slot_list_len = 1,
+            .accounts = .disk,
+            .index = .ram,
+            .name = "100k accounts (1_slot - ram index - disk accounts)",
+        },
+        BenchArgs{
+            .n_accounts = 100_000,
+            .slot_list_len = 1,
+            .accounts = .disk,
+            .index = .disk,
+            .name = "100k accounts (1_slot - disk index - disk accounts)",
+        },
 
         // // test accounts in ram
         // BenchArgs{
