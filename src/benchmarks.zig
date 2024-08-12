@@ -55,15 +55,15 @@ pub fn main() !void {
             );
         }
 
-        if (std.mem.eql(u8, "accounts_db_snapshot", filter) or run_all) {
-            // NOTE: for this benchmark you need to setup a snapshot in test_data/snapshot_bench
-            // and run as a binary ./zig-out/bin/... so the open file limits are ok
-            try benchmark(
-                @import("accountsdb/db.zig").BenchmarkAccountsDBSnapshotLoad,
-                max_time_per_bench,
-                TimeUnits.nanoseconds,
-            );
-        }
+        // if (std.mem.eql(u8, "accounts_db_snapshot", filter) or run_all) {
+        //     // NOTE: for this benchmark you need to setup a snapshot in test_data/snapshot_bench
+        //     // and run as a binary ./zig-out/bin/... so the open file limits are ok
+        //     try benchmark(
+        //         @import("accountsdb/db.zig").BenchmarkAccountsDBSnapshotLoad,
+        //         max_time_per_bench,
+        //         TimeUnits.nanoseconds,
+        //     );
+        // }
     }
 
     if (std.mem.startsWith(u8, filter, "socket_utils") or run_all_benchmarks) {

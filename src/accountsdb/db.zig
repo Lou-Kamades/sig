@@ -3100,33 +3100,33 @@ pub const BenchmarkAccountsDB = struct {
 
     pub const args = [_]BenchArgs{
         // BenchArgs{
-        //     .n_accounts = 100_000,
+        //     .n_accounts = 1_000_000,
         //     .slot_list_len = 1,
-        //     .accounts = .ram,
+        //     .accounts = .disk,
         //     .index = .ram,
-        //     .name = "100k accounts (1_slot - ram index - ram accounts)",
-        // },
-        // BenchArgs{
-        //     .n_accounts = 100_000,
-        //     .slot_list_len = 1,
-        //     .accounts = .ram,
-        //     .index = .disk,
-        //     .name = "100k accounts (1_slot - disk index - ram accounts)",
+        //     .name = "1M accounts (1_slot - ram index - disk accounts)",
         // },
         BenchArgs{
-            .n_accounts = 100_000,
-            .slot_list_len = 1,
-            .accounts = .disk,
-            .index = .ram,
-            .name = "100k accounts (1_slot - ram index - disk accounts)",
-        },
-        BenchArgs{
-            .n_accounts = 100_000,
+            .n_accounts = 1_000_000,
             .slot_list_len = 1,
             .accounts = .disk,
             .index = .disk,
-            .name = "100k accounts (1_slot - disk index - disk accounts)",
+            .name = "1M accounts (1_slot - disk index - disk accounts)",
         },
+        // BenchArgs{
+        //     .n_accounts = 5_000_000,
+        //     .slot_list_len = 1,
+        //     .accounts = .disk,
+        //     .index = .ram,
+        //     .name = "5M accounts (1_slot - ram index - disk accounts)",
+        // },
+        // BenchArgs{
+        //     .n_accounts = 5_000_000,
+        //     .slot_list_len = 1,
+        //     .accounts = .disk,
+        //     .index = .disk,
+        //     .name = "5M accounts (1_slot - disk index - disk accounts)",
+        // },
 
         // // test accounts in ram
         // BenchArgs{
@@ -3237,7 +3237,6 @@ pub const BenchmarkAccountsDB = struct {
 
         var random = std.Random.DefaultPrng.init(19);
         const rng = random.random();
-        const slot: u64 = 0;
 
         var pubkeys = try allocator.alloc(Pubkey, n_accounts);
         defer allocator.free(pubkeys);
@@ -3256,19 +3255,30 @@ pub const BenchmarkAccountsDB = struct {
         }
 
         if (bench_args.accounts == .ram) {
-            const n_accounts_init = bench_args.n_accounts;
-            var accounts = try allocator.alloc(Account, n_accounts_init);
-            for (0..n_accounts_init) |i| {
+            const n_accounts_init = bench_args.n_accounts_multiple * bench_args.n_accounts;
+            const accounts = try allocator.alloc(Account, (total_n_accounts + n_accounts_init));
+            for (0..(total_n_accounts + n_accounts_init)) |i| {
                 accounts[i] = try Account.random(allocator, rng, i % 1_000);
             }
 
-            var timer = try std.time.Timer.start();
+            if (n_accounts_init > 0) {
+                try accounts_db.putAccountSlice(
+                    accounts[total_n_accounts..(total_n_accounts + n_accounts_init)],
+                    pubkeys,
+                    @as(u64, @intCast(0)),
+                );
+            }
 
-            try accounts_db.putAccountSlice(
-                accounts,
-                pubkeys,
-                slot,
-            );
+            var timer = try std.time.Timer.start();
+            for (0..slot_list_len) |i| {
+                const start_index = i * n_accounts;
+                const end_index = start_index + n_accounts;
+                try accounts_db.putAccountSlice(
+                    accounts[start_index..end_index],
+                    pubkeys,
+                    @as(u64, @intCast(i)),
+                );
+            }
             const elapsed = timer.read();
             std.debug.print("WRITE: {d}\n", .{elapsed});
         } else {
