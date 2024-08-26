@@ -41,6 +41,13 @@ const StatusCache = sig.accounts_db.StatusCache;
 const BankFields = sig.accounts_db.snapshots.BankFields;
 const BankHashInfo = sig.accounts_db.snapshots.BankHashInfo;
 
+const c = @cImport({
+    @cInclude("unistd.h");
+    @cInclude("sys/wait.h");
+    @cInclude("signal.h");
+    @cInclude("stdlib.h");
+});
+
 // NOTE: this constant has a large impact on performance due to allocations (best to overestimate)
 pub const ACCOUNTS_PER_FILE_EST: usize = 1500;
 
@@ -3099,119 +3106,13 @@ pub const BenchmarkAccountsDB = struct {
     };
 
     pub const args = [_]BenchArgs{
-        // BenchArgs{
-        //     .n_accounts = 100_000,
-        //     .slot_list_len = 1,
-        //     .accounts = .ram,
-        //     .index = .ram,
-        //     .name = "100k accounts (1_slot - ram index - ram accounts)",
-        // },
-        // BenchArgs{
-        //     .n_accounts = 100_000,
-        //     .slot_list_len = 1,
-        //     .accounts = .ram,
-        //     .index = .disk,
-        //     .name = "100k accounts (1_slot - disk index - ram accounts)",
-        // },
-        // BenchArgs{
-        //     .n_accounts = 100_000,
-        //     .slot_list_len = 1,
-        //     .accounts = .disk,
-        //     .index = .ram,
-        //     .name = "100k accounts (1_slot - ram index - disk accounts)",
-        // },
         BenchArgs{
-            .n_accounts = 100_000,
+            .n_accounts = 1_000_000,
             .slot_list_len = 1,
             .accounts = .disk,
-            .index = .disk,
-            .name = "100k accounts (1_slot - disk index - disk accounts)",
+            .index = .ram,
+            .name = "1M accounts (1_slot - disk index - disk accounts)",
         },
-
-        // // test accounts in ram
-        // BenchArgs{
-        //     .n_accounts = 100_000,
-        //     .slot_list_len = 1,
-        //     .accounts = .ram,
-        //     .index = .ram,
-        //     .name = "100k accounts (1_slot - ram index - ram accounts)",
-        // },
-        // BenchArgs{
-        //     .n_accounts = 10_000,
-        //     .slot_list_len = 10,
-        //     .accounts = .ram,
-        //     .index = .ram,
-        //     .name = "10k accounts (10_slots - ram index - ram accounts)",
-        // },
-
-        // // tests large number of accounts on disk
-        // BenchArgs{
-        //     .n_accounts = 10_000,
-        //     .slot_list_len = 10,
-        //     .accounts = .disk,
-        //     .index = .ram,
-        //     .name = "10k accounts (10_slots - ram index - disk accounts)",
-        // },
-        // BenchArgs{
-        //     .n_accounts = 500_000,
-        //     .slot_list_len = 1,
-        //     .accounts = .disk,
-        //     .index = .ram,
-        //     .name = "500k accounts (1_slot - ram index - disk accounts)",
-        // },
-        // BenchArgs{
-        //     .n_accounts = 500_000,
-        //     .slot_list_len = 3,
-        //     .accounts = .disk,
-        //     .index = .ram,
-        //     .name = "500k accounts (3_slot - ram index - disk accounts)",
-        // },
-        // BenchArgs{
-        //     .n_accounts = 3_000_000,
-        //     .slot_list_len = 1,
-        //     .accounts = .disk,
-        //     .index = .ram,
-        //     .name = "3M accounts (1_slot - ram index - disk accounts)",
-        // },
-        // BenchArgs{
-        //     .n_accounts = 3_000_000,
-        //     .slot_list_len = 3,
-        //     .accounts = .disk,
-        //     .index = .ram,
-        //     .name = "3M accounts (3_slot - ram index - disk accounts)",
-        // },
-        // BenchArgs{
-        //     .n_accounts = 500_000,
-        //     .slot_list_len = 1,
-        //     .accounts = .disk,
-        //     .n_accounts_multiple = 2, // 1 mill accounts init
-        //     .index = .ram,
-        //     .name = "3M accounts (3_slot - ram index - disk accounts)",
-        // },
-
-        // // testing disk indexes
-        // BenchArgs{
-        //     .n_accounts = 500_000,
-        //     .slot_list_len = 1,
-        //     .accounts = .disk,
-        //     .index = .disk,
-        //     .name = "500k accounts (1_slot - disk index - disk accounts)",
-        // },
-        // BenchArgs{
-        //     .n_accounts = 3_000_000,
-        //     .slot_list_len = 1,
-        //     .accounts = .disk,
-        //     .index = .disk,
-        //     .name = "3m accounts (1_slot - disk index - disk accounts)",
-        // },
-        // BenchArgs{
-        //     .n_accounts = 500_000,
-        //     .slot_list_len = 1,
-        //     .accounts = .disk,
-        //     .index = .disk,
-        //     .n_accounts_multiple = 2,
-        //     .name = "500k accounts (1_slot - disk index - disk accounts)",
-        // },
     };
 
     pub fn readWriteAccounts(bench_args: BenchArgs) !u64 {
@@ -3254,116 +3155,128 @@ pub const BenchmarkAccountsDB = struct {
             }
         }
 
-        if (bench_args.accounts == .ram) {
-            const n_accounts_init = bench_args.n_accounts_multiple * bench_args.n_accounts;
-            const accounts = try allocator.alloc(Account, (total_n_accounts + n_accounts_init));
-            for (0..(total_n_accounts + n_accounts_init)) |i| {
-                accounts[i] = try Account.random(allocator, rng, i % 1_000);
-            }
+        var account_files = try ArrayList(AccountFile).initCapacity(allocator, slot_list_len);
+        defer account_files.deinit();
 
-            if (n_accounts_init > 0) {
-                try accounts_db.putAccountSlice(
-                    accounts[total_n_accounts..(total_n_accounts + n_accounts_init)],
-                    pubkeys,
-                    @as(u64, @intCast(0)),
+        for (0..(slot_list_len + bench_args.n_accounts_multiple)) |s| {
+            var size: usize = 0;
+            for (0..total_n_accounts) |i| {
+                const data_len = i % 1_000;
+                size += std.mem.alignForward(
+                    usize,
+                    AccountInFile.STATIC_SIZE + data_len,
+                    @sizeOf(u64),
                 );
             }
+            const aligned_size = std.mem.alignForward(usize, size, std.mem.page_size);
+            const filepath = try std.fmt.allocPrint(allocator, disk_path ++ "slot{d}.bin", .{s});
 
-            var timer = try std.time.Timer.start();
-            for (0..slot_list_len) |i| {
-                const start_index = i * n_accounts;
-                const end_index = start_index + n_accounts;
-                try accounts_db.putAccountSlice(
-                    accounts[start_index..end_index],
-                    pubkeys,
-                    @as(u64, @intCast(i)),
+            const length = blk: {
+                var file = try std.fs.cwd().createFile(filepath, .{ .read = true });
+                defer file.close();
+
+                // resize the file
+                const file_size = (try file.stat()).size;
+                if (file_size < aligned_size) {
+                    try file.seekTo(aligned_size - 1);
+                    _ = try file.write(&[_]u8{1});
+                    try file.seekTo(0);
+                }
+
+                var memory = try std.posix.mmap(
+                    null,
+                    aligned_size,
+                    std.posix.PROT.READ | std.posix.PROT.WRITE,
+                    std.posix.MAP{ .TYPE = .SHARED }, // need it written to the file before it can be used
+                    file.handle,
+                    0,
                 );
-            }
-            const elapsed = timer.read();
-            std.debug.print("WRITE: {d}\n", .{elapsed});
-        } else {
-            var account_files = try ArrayList(AccountFile).initCapacity(allocator, slot_list_len);
-            defer account_files.deinit();
 
-            for (0..(slot_list_len + bench_args.n_accounts_multiple)) |s| {
-                var size: usize = 0;
-                for (0..total_n_accounts) |i| {
-                    const data_len = i % 1_000;
-                    size += std.mem.alignForward(
-                        usize,
-                        AccountInFile.STATIC_SIZE + data_len,
-                        @sizeOf(u64),
-                    );
+                var offset: usize = 0;
+                for (0..n_accounts) |i| {
+                    const account = try Account.random(allocator, rng, i % 1_000);
+                    defer allocator.free(account.data);
+                    var pubkey = pubkeys[i % n_accounts];
+                    offset += account.writeToBuf(&pubkey, memory[offset..]);
                 }
-                const aligned_size = std.mem.alignForward(usize, size, std.mem.page_size);
-                const filepath = try std.fmt.allocPrint(allocator, disk_path ++ "slot{d}.bin", .{s});
+                break :blk offset;
+            };
 
-                const length = blk: {
-                    var file = try std.fs.cwd().createFile(filepath, .{ .read = true });
-                    defer file.close();
+            var account_file = blk: {
+                const file = try std.fs.cwd().openFile(filepath, .{ .mode = .read_write });
+                errdefer file.close();
+                break :blk try AccountFile.init(file, .{ .id = FileId.fromInt(@intCast(s)), .length = length }, s);
+            };
+            errdefer account_file.deinit();
 
-                    // resize the file
-                    const file_size = (try file.stat()).size;
-                    if (file_size < aligned_size) {
-                        try file.seekTo(aligned_size - 1);
-                        _ = try file.write(&[_]u8{1});
-                        try file.seekTo(0);
-                    }
-
-                    var memory = try std.posix.mmap(
-                        null,
-                        aligned_size,
-                        std.posix.PROT.READ | std.posix.PROT.WRITE,
-                        std.posix.MAP{ .TYPE = .SHARED }, // need it written to the file before it can be used
-                        file.handle,
-                        0,
-                    );
-
-                    var offset: usize = 0;
-                    for (0..n_accounts) |i| {
-                        const account = try Account.random(allocator, rng, i % 1_000);
-                        defer allocator.free(account.data);
-                        var pubkey = pubkeys[i % n_accounts];
-                        offset += account.writeToBuf(&pubkey, memory[offset..]);
-                    }
-                    break :blk offset;
-                };
-
-                var account_file = blk: {
-                    const file = try std.fs.cwd().openFile(filepath, .{ .mode = .read_write });
-                    errdefer file.close();
-                    break :blk try AccountFile.init(file, .{ .id = FileId.fromInt(@intCast(s)), .length = length }, s);
-                };
-                errdefer account_file.deinit();
-
-                if (s < bench_args.n_accounts_multiple) {
-                    try accounts_db.putAccountFile(&account_file, n_accounts);
-                } else {
-                    // to be indexed later (and timed)
-                    account_files.appendAssumeCapacity(account_file);
-                }
-                all_filenames.appendAssumeCapacity(filepath);
+            if (s < bench_args.n_accounts_multiple) {
+                try accounts_db.putAccountFile(&account_file, n_accounts);
+            } else {
+                // to be indexed later (and timed)
+                account_files.appendAssumeCapacity(account_file);
             }
-
-            var timer = try std.time.Timer.start();
-            for (account_files.items) |*account_file| {
-                try accounts_db.putAccountFile(account_file, n_accounts);
-            }
-            const elapsed = timer.read();
-
-            std.debug.print("WRITE: {d}\n", .{elapsed});
+            all_filenames.appendAssumeCapacity(filepath);
         }
 
-        var t2 = try std.time.Timer.start();
+        // Write
+        var duration: u64 = 0;
+
+        // spawn perf record process
+        const pid = c.getpid();
+        var pid_str = try std.fmt.allocPrint(allocator, "{d}", .{pid});
+        defer allocator.free(pid_str);
+        var child = std.process.Child.init(&.{ "perf", "record", "-g", "-o", "write.data", "-p", pid_str, "--freq=max" }, allocator);
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        try child.spawn();
+        // std.debug.print("Started process with PID: {}\n", .{pid});
+        std.time.sleep(1 * std.time.ns_per_s);
+
+        // main
+        var timer = try std.time.Timer.start();
+        for (account_files.items) |*account_file| {
+            try accounts_db.putAccountFile(account_file, n_accounts);
+        }
+        duration = timer.read();
+        // std.debug.print("writes done\n", .{});
+
+        // Signal perf record process to finish
+        // std.debug.print("Sending SIGINT to child\n", .{});
+        _ = c.kill(child.id, c.SIGINT);
+        var term = try child.wait();
+        // std.debug.print("{}\n", .{term});
+
+        std.debug.print("WRITE: {d}\n", .{duration});
+
+        // READ
+        const read_pid = c.getpid();
+        pid_str = try std.fmt.allocPrint(allocator, "{d}", .{read_pid});
+        var read_child = std.process.Child.init(&.{ "perf", "record", "-g", "-o", "read.data", "-p", pid_str, "--freq=max" }, allocator);
+        read_child.stdout_behavior = .Ignore;
+        read_child.stderr_behavior = .Ignore;
+        try read_child.spawn();
+
+        // std.debug.print("Started process with PID: {}\n", .{read_pid});
+
+        // main
+        var timer2 = try std.time.Timer.start();
         for (0..n_accounts) |i| {
-            const pubkey = &pubkeys[i];
-            const account = try accounts_db.getAccount(pubkey);
+            const account = try accounts_db.getAccount(&pubkeys[i]);
             if (account.data.len != (i % 1_000)) {
                 std.debug.panic("account data len dnm {}: {} != {}", .{ i, account.data.len, (i % 1_000) });
             }
         }
-        const elapsed = t2.read();
-        std.debug.print("READ: {d}\n", .{elapsed});
-        return elapsed;
+        duration = timer2.read();
+        // std.debug.print("reads done\n", .{});
+
+        // Signal perf record process to finish
+        // std.debug.print("Sending SIGINT to child\n", .{});
+        _ = c.kill(child.id, c.SIGINT);
+        term = try child.wait();
+        // std.debug.print("{}\n", .{term});
+
+        std.debug.print("READ: {d}\n", .{duration});
+
+        return 0;
     }
 };
