@@ -492,6 +492,22 @@ pub fn run() !void {
                     },
 
                     &cli.Command{
+                        .name = "untar",
+                        .description = .{
+                            .one_line = "untar test",
+                        },
+                        .options = &.{
+                            &snapshot_dir_option,
+                            &genesis_file_path,
+                        },
+                        .target = .{
+                            .action = .{
+                                .exec = untar,
+                            },
+                        },
+                    },
+
+                    &cli.Command{
                         .name = "print-manifest",
                         .description = .{
                             .one_line = "Prints a manifest file",
@@ -915,9 +931,40 @@ fn validateSnapshot() !void {
     defer snapshot_result.deinit();
 }
 
+fn untar() !void {
+    const allocator = std.heap.c_allocator;
+    const Level = @import("../trace/level.zig").Level;
+    var logger = Logger.init(allocator, Level.debug);
+    logger.spawn();
+    defer logger.deinit();
+
+    const dir = try std.fs.cwd().makeOpenPath("/home/d/lou-dev/sig/snap_accounts_db", .{});
+    const file = try dir.openFile("/home/d/lou-dev/sig/snap_accounts_db/snapshot-290392037-HFrkN91RWAntx4Y1NYN3VDyZ8CwWA1gLjwBG1wHVVehc.tar.zst", .{});
+    const file_stat = try file.stat();
+    const file_size: u64 = @intCast(file_stat.size);
+    const memory = try std.posix.mmap(
+        null,
+        file_size,
+        std.posix.PROT.READ,
+        std.posix.MAP{ .TYPE = .SHARED },
+        file.handle,
+        0,
+    );
+    var tar_stream = try zstd.Reader.init(memory);
+    defer tar_stream.deinit();
+
+    try sig.utils.tar.sequentialUntarToFileSystem(
+        allocator,
+        logger,
+        dir,
+        tar_stream.reader(),
+        450000,
+    );
+}
+
 /// entrypoint to print the leader schedule and then exit
 fn printLeaderSchedule() !void {
-    const allocator = gpa_allocator;
+    const allocator = std.heap.c_allocator;
     var app_base = try AppBase.init(allocator);
 
     const leader_schedule = try getLeaderScheduleFromCli(allocator) orelse b: {
@@ -1285,7 +1332,7 @@ fn loadSnapshot(
     result.allocator = allocator;
 
     const snapshot_dir_str = config.current.accounts_db.snapshot_dir;
-    var snapshot_dir = try std.fs.cwd().makeOpenPath(snapshot_dir_str, .{ .iterate = true });
+    var snapshot_dir = try std.fs.cwd().makeOpenPath("/home/d/lou-dev/sig/snap_accounts_db", .{ .iterate = true });
     defer snapshot_dir.close();
 
     var all_snapshot_fields, const snapshot_files = try getOrDownloadSnapshots(allocator, logger, gossip_service, .{

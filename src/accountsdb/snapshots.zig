@@ -25,6 +25,7 @@ const Logger = sig.trace.Logger;
 
 const defaultArrayListUnmanagedOnEOFConfig = bincode.arraylist.defaultArrayListUnmanagedOnEOFConfig;
 const parallelUntarToFileSystem = sig.utils.tar.parallelUntarToFileSystem;
+const sequentialUntarToFileSystem = sig.utils.tar.sequentialUntarToFileSystem;
 const readDirectory = sig.utils.directory.readDirectory;
 
 pub const MAXIMUM_ACCOUNT_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB
@@ -1843,13 +1844,14 @@ pub fn parallelUnpackZstdTarBall(
     var tar_stream = try zstd.Reader.init(memory);
     defer tar_stream.deinit();
     const n_files_estimate: usize = if (full_snapshot) 421_764 else 100_000; // estimate
+    logger.infof("n_threads {}", .{n_threads});
 
-    try parallelUntarToFileSystem(
+    try sequentialUntarToFileSystem(
         allocator,
         logger,
         output_dir,
         tar_stream.reader(),
-        n_threads,
+        // n_threads,
         n_files_estimate,
     );
 }

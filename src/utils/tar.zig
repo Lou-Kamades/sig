@@ -1,4 +1,5 @@
 const std = @import("std");
+const zstd = @import("zstd");
 const TarOutputHeader = std.tar.output.Header;
 
 const sig = @import("../sig.zig");
@@ -62,6 +63,151 @@ pub const UnTarTask = ThreadPoolTask(UnTarEntry);
 
 const Logger = @import("../trace/log.zig").Logger;
 
+pub fn getStackUsage(initial_stack_address: usize) usize {
+    var stack_variable: u8 = undefined;
+    const current_address = @intFromPtr(&stack_variable);
+    return if (current_address > initial_stack_address)
+        current_address - initial_stack_address
+    else
+        initial_stack_address - current_address;
+}
+
+pub fn printStackUsage(initial_stack_address: usize) void {
+    const usage = getStackUsage(initial_stack_address);
+    std.debug.print("Current stack usage: {} bytes\n", .{usage});
+}
+
+pub fn sequentialUntarToFileSystem(
+    allocator: std.mem.Allocator,
+    logger: Logger,
+    dir: std.fs.Dir,
+    reader: anytype,
+    n_files_estimate: ?usize,
+) !void {
+    var timer = try sig.time.Timer.start();
+    var progress_timer = try sig.time.Timer.start();
+    var file_count: usize = 0;
+    const strip_components: u32 = 0;
+    var num_mmaps: u32 = 0;
+
+    // Global variable to store the initial stack address
+    // const initial_stack_address: usize = undefined;
+
+    loop: while (true) {
+        const header_buf = try allocator.alloc(u8, 512);
+        switch (try reader.readAtLeast(header_buf, 512)) {
+            0 => break,
+            512 => {},
+            else => |actual_size| std.debug.panic("Actual file size ({d}) too small for header (< 512).", .{actual_size}),
+        }
+
+        const header: TarHeaderMinimal = .{ .bytes = header_buf[0..512] };
+        defer allocator.free(header_buf);
+
+        const file_size = try header.size();
+        // logger.infof("file_size {}", .{file_size});
+        const rounded_file_size = std.mem.alignForward(u64, file_size, 512);
+        const pad_len = rounded_file_size - file_size;
+
+        var file_name_buf = try allocator.alloc(u8, 255);
+        defer allocator.free(file_name_buf);
+        const unstripped_file_name = try header.fullName(file_name_buf[0..255]);
+
+        switch (header.kind()) {
+            .directory => {
+                const file_name = try stripComponents(unstripped_file_name, strip_components);
+                if (file_name.len != 0) {
+                    try dir.makePath(file_name);
+                }
+            },
+            .normal => {
+                if (file_size == 0 and unstripped_file_name.len == 0) {
+                    break :loop; // tar EOF
+                }
+
+                const file_name = try stripComponents(unstripped_file_name, strip_components);
+                // logger.infof("file_name {s}", .{file_name});
+                if (std.fs.path.dirname(file_name)) |dir_name| {
+                    try dir.makePath(dir_name);
+                }
+
+                if (n_files_estimate) |total_n_files| {
+                    if (progress_timer.read().asNanos() > TAR_PROGRESS_UPDATES.asNanos()) {
+                        printTimeEstimate(
+                            logger,
+                            &timer,
+                            total_n_files,
+                            file_count,
+                            "untar",
+                            null,
+                        );
+                        progress_timer.reset();
+                    }
+                }
+                file_count += 1;
+
+                // pasted task
+
+                {
+                    const contents = try allocator.alloc(u8, file_size);
+                    defer {
+                        // std.debug.print("freeing contents", .{});
+                        allocator.free(contents);
+                    }
+                    const actual_contents_len = try reader.readAtLeast(contents, file_size);
+                    if (actual_contents_len != file_size) {
+                        std.debug.panic("Reported file ({d}) size does not match actual file size ({d})", .{ contents.len, actual_contents_len });
+                    }
+
+                    try reader.skipBytes(pad_len, .{});
+                    var file = try dir.createFile(file_name, .{ .read = true });
+                    defer {
+                        // std.debug.print("closing file", .{});
+                        file.close();
+                    }
+
+                    const file_size2 = contents.len;
+                    try file.seekTo(file_size2 - 1);
+                    _ = try file.write(&[_]u8{1});
+                    try file.seekTo(0);
+
+                    num_mmaps += 1;
+                    const memory = try std.posix.mmap(
+                        null,
+                        file_size2,
+                        std.posix.PROT.WRITE,
+                        std.posix.MAP{ .TYPE = .SHARED },
+                        file.handle,
+                        0,
+                    );
+                    @memcpy(memory, contents);
+                }
+
+                // std.debug.print("num mmaps: {d}\n", .{num_mmaps});
+
+                // do task
+                // var entry = UnTarEntry{
+                //     .allocator = allocator,
+                //     .contents = contents,
+                //     .dir = dir,
+                //     .file_name = file_name,
+                //     .filename_buf = file_name_buf,
+                //     .header_buf = header_buf,
+                // };
+                // try entry.callback();
+                // printStackUsage(initial_stack_address);
+                // gpaa.detectLeaks();
+            },
+            .global_extended_header, .extended_header => {
+                return error.TarUnsupportedFileType;
+            },
+            .hard_link => return error.TarUnsupportedFileType,
+            .symbolic_link => return error.TarUnsupportedFileType,
+            else => return error.TarUnsupportedFileType,
+        }
+    }
+}
+
 pub fn parallelUntarToFileSystem(
     allocator: std.mem.Allocator,
     logger: Logger,
@@ -86,8 +232,10 @@ pub fn parallelUntarToFileSystem(
     var progress_timer = try sig.time.Timer.start();
     var file_count: usize = 0;
     const strip_components: u32 = 0;
+    var total_bytes_alloced: u64 = 0;
     loop: while (true) {
         const header_buf = try allocator.alloc(u8, 512);
+        total_bytes_alloced += 512;
         switch (try reader.readAtLeast(header_buf, 512)) {
             0 => break,
             512 => {},
@@ -97,10 +245,12 @@ pub fn parallelUntarToFileSystem(
         const header: TarHeaderMinimal = .{ .bytes = header_buf[0..512] };
 
         const file_size = try header.size();
+        // logger.infof("file_size {}", .{file_size});
         const rounded_file_size = std.mem.alignForward(u64, file_size, 512);
         const pad_len = rounded_file_size - file_size;
 
         var file_name_buf = try allocator.alloc(u8, 255);
+        total_bytes_alloced += 255;
         const unstripped_file_name = try header.fullName(file_name_buf[0..255]);
 
         switch (header.kind()) {
@@ -120,6 +270,7 @@ pub fn parallelUntarToFileSystem(
                 }
 
                 const file_name = try stripComponents(unstripped_file_name, strip_components);
+                // logger.infof("file_name {s}", .{file_name});
                 if (std.fs.path.dirname(file_name)) |dir_name| {
                     try dir.makePath(dir_name);
                 }
@@ -140,13 +291,16 @@ pub fn parallelUntarToFileSystem(
                 file_count += 1;
 
                 const contents = try allocator.alloc(u8, file_size);
+                total_bytes_alloced += file_size;
                 const actual_contents_len = try reader.readAtLeast(contents, file_size);
                 if (actual_contents_len != file_size) {
                     std.debug.panic("Reported file ({d}) size does not match actual file size ({d})", .{ contents.len, actual_contents_len });
                 }
 
                 try reader.skipBytes(pad_len, .{});
-
+                //  734343540
+                //  5944851408
+                // logger.infof("tot alloced: {}", .{total_bytes_alloced});
                 const task_ptr = &tasks[UnTarTask.awaitAndAcquireFirstAvailableTask(tasks, 0)];
                 task_ptr.result catch |err| logger.errf("UnTarTask encountered error: {s}", .{@errorName(err)});
                 task_ptr.entry = .{
@@ -169,6 +323,7 @@ pub fn parallelUntarToFileSystem(
             else => return error.TarUnsupportedFileType,
         }
     }
+    std.debug.print("loop done", .{});
 
     // wait for all tasks
     for (tasks) |*task| {
@@ -314,4 +469,36 @@ fn nullStr(str: []const u8) []const u8 {
         if (c == 0) return str[0..i];
     }
     return str;
+}
+// utils.tar.test.sequentialUntar should no
+test "goo" {
+    const Level = @import("../trace/level.zig").Level;
+
+    const allocator = std.testing.allocator;
+    var logger = Logger.init(allocator, Level.debug);
+    logger.spawn();
+    defer logger.deinit();
+
+    const dir = try std.fs.cwd().makeOpenPath("/home/d/lou-dev/sig/snap_accounts_db", .{});
+    const file = try dir.openFile("/home/d/lou-dev/sig/snap_accounts_db/snapshot-290392037-HFrkN91RWAntx4Y1NYN3VDyZ8CwWA1gLjwBG1wHVVehc.tar.zst", .{});
+    const file_stat = try file.stat();
+    const file_size: u64 = @intCast(file_stat.size);
+    const memory = try std.posix.mmap(
+        null,
+        file_size,
+        std.posix.PROT.READ,
+        std.posix.MAP{ .TYPE = .SHARED },
+        file.handle,
+        0,
+    );
+    var tar_stream = try zstd.Reader.init(memory);
+    defer tar_stream.deinit();
+
+    try sequentialUntarToFileSystem(
+        allocator,
+        logger,
+        dir,
+        tar_stream.reader(),
+        450000,
+    );
 }
