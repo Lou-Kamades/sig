@@ -354,6 +354,8 @@ pub const AccountsDB = struct {
         accounts_per_file_estimate: u64,
     ) !sig.time.Duration {
         self.logger.infof("loading from snapshot...", .{});
+        self.logger.infof("loading from snapshot...{}", .{n_threads});
+        self.logger.infof("loading from snapshot...{}", .{per_thread_allocator});
 
         // used to read account files
         const n_parse_threads = n_threads;
@@ -375,6 +377,8 @@ pub const AccountsDB = struct {
             defer bhs_lg.unlock();
             bhs.accumulate(snapshot_manifest.bank_hash_info.stats);
         }
+
+        std.debug.print("loadAndVerifyAccountsFiles\n", .{});
 
         // short path
         if (n_threads == 1) {
@@ -508,8 +512,10 @@ pub const AccountsDB = struct {
         defer file_map_lg.unlock();
 
         const n_account_files = file_map_end_index - file_map_start_index;
+        std.debug.print("ensureTotalCapacity: {}\n", .{n_account_files});
         try file_map.ensureTotalCapacity(self.allocator, n_account_files);
 
+        std.debug.print("bin_counts\n", .{});
         const bin_counts = try self.allocator.alloc(usize, self.account_index.numberOfBins());
         defer self.allocator.free(bin_counts);
         @memset(bin_counts, 0);
@@ -517,6 +523,7 @@ pub const AccountsDB = struct {
         // allocate all the references in one shot with a wrapper allocator
         // without this large allocation, snapshot loading is very slow
         const n_accounts_estimate = n_account_files * accounts_per_file_est;
+        std.debug.print("initCapacity {}\n", .{n_accounts_estimate});
         var references = try ArrayList(AccountRef).initCapacity(
             self.account_index.reference_allocator,
             n_accounts_estimate,
@@ -554,6 +561,7 @@ pub const AccountsDB = struct {
             }
         }
 
+        std.debug.print("file loop\n", .{});
         for (
             file_info_map.keys()[file_map_start_index..file_map_end_index],
             file_info_map.values()[file_map_start_index..file_map_end_index],
@@ -3333,6 +3341,42 @@ fn loadTestAccountsDB(allocator: std.mem.Allocator, use_disk: bool, n_threads: u
     return .{ accounts_db, snapshots };
 }
 
+pub fn threadIssue() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    // const allocator = std.heap.c_allocator;
+    const logger = Logger{ .noop = {} };
+
+    var snapshot_dir = try std.fs.cwd().openDir("/home/d/lou-dev/sig/snap_accounts_db", .{ .iterate = true });
+    const snapshot_file_info = try SnapshotFiles.find(allocator, snapshot_dir);
+    defer snapshot_dir.close();
+
+    std.debug.print("AccountsDB.init\n", .{});
+    var accounts_db = try AccountsDB.init(allocator, logger, snapshot_dir, .{
+        .number_of_index_bins = 32,
+        .use_disk_index = false,
+    }, null);
+    defer accounts_db.deinit(true);
+    std.debug.print("AccountsDB.init done\n", .{});
+
+    var accounts_dir = try std.fs.cwd().openDir("snap_accounts_db/accounts", .{ .iterate = true });
+    defer accounts_dir.close();
+
+    std.debug.print("reading snapshot metadata...\n", .{});
+    const snapshots = try AllSnapshotFields.fromFiles(allocator, logger, snapshot_dir, snapshot_file_info);
+    std.debug.print("read snapshot metdata done ", .{});
+
+    std.debug.print("loadFromSnapshot\n", .{});
+    const duration = try accounts_db.loadFromSnapshot(
+        snapshots.full.accounts_db_fields,
+        8, //threads
+        allocator,
+        500,
+    );
+
+    std.debug.print("snap load took: {}", .{duration});
+}
+
 // NOTE: this is a memory leak test - geyser correctness is tested in the geyser tests
 test "geyser stream on load" {
     const allocator = std.testing.allocator;
@@ -4268,7 +4312,7 @@ pub const BenchmarkAccountsDB = struct {
 
         var snapshot_dir = try std.fs.cwd().makeOpenPath(sig.VALIDATOR_DIR ++ "accounts_db", .{});
         defer snapshot_dir.close();
-
+        // here
         const logger = Logger{ .noop = {} };
         var accounts_db: AccountsDB = try AccountsDB.init(allocator, logger, snapshot_dir, .{
             .number_of_index_bins = ACCOUNT_INDEX_BINS,

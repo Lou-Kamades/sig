@@ -11,6 +11,8 @@ index_storage/
 kcov-output/
 .vscode/
 
+snap_accounts_db
+
 /gossip-dumps
 
 **/.DS_Store

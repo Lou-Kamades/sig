@@ -35,6 +35,7 @@ const parseLeaderSchedule = sig.core.leader_schedule.parseLeaderSchedule;
 const requestIpEcho = sig.net.requestIpEcho;
 const spawnMetrics = sig.prometheus.spawnMetrics;
 const writeLeaderSchedule = sig.core.leader_schedule.writeLeaderSchedule;
+const threadIssue = sig.accounts_db.db.threadIssue;
 
 const BlockstoreReader = sig.ledger.BlockstoreReader;
 const BlockstoreWriter = sig.ledger.BlockstoreWriter;
@@ -505,6 +506,21 @@ pub fn run() !void {
                         .target = .{
                             .action = .{
                                 .exec = printManifest,
+                            },
+                        },
+                    },
+
+                    &cli.Command{
+                        .name = "thread-issue",
+                        .description = .{
+                            .one_line = "Prints a manifest file",
+                            .detailed =
+                            \\ Loads and prints a manifest file
+                            ,
+                        },
+                        .target = .{
+                            .action = .{
+                                .exec = threadIssue,
                             },
                         },
                     },
